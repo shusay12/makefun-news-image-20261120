@@ -1,104 +1,160 @@
-"""Build entry.png: the world news of Friday 20 November 2026 in one image.
+#!/usr/bin/env python3
+"""Rebuild the 20 November 2026 front page from its four panels.
 
-Four generated editorial illustrations, one per top story of the day, are
-composited into a 1024x1024 front page: a navy header naming the day, then a
-2x2 grid of panels, each with a bold headline strip so a viewer who missed
-the day can tell what happened from the image alone.
+Composes ``entry.png`` (1024x1024): a navy masthead naming the day, a
+gold rule, then a 2x2 grid of illustrations.  Each cell pairs its
+picture with a dark caption strip carrying a gold headline and a
+one-line white summary.
 
-The four stories, each tied to an event happening on 20 November 2026
-(checked at ~01:30 UTC, only ~1.5 hours into the UTC day, so the day's news
-is still thin - see the caveat in BUILD-REPORT.md):
-  1. Cyclone Akvan makes landfall on India's east coast around noon
-     (IMD; 300,000+ evacuated, 423 rescue teams, 69 trains cancelled).
-  2. Taiwan's Financial Supervisory Commission short-selling curbs take
-     effect today after the Taiex's 4.4% plunge (Reuters).
-  3. COP31 enters its scheduled closing day in Antalya with no deal yet;
-     the final text is due by midnight Friday (UN News, Reuters).
-  4. Trump, back from China, holds a White House press conference today
-     (announced for the 20th).
+Usage:  python3 build_image.py [output-path]
+The output defaults to ``repro-entry.png`` next to this script, so a
+plain run never clobbers the judged ``entry.png``.
 
-Run: python3 build_image.py   (reads panels/, writes entry.png)
+Requires Pillow.  No network access; everything is read from ``panels/``.
 """
 
+from __future__ import annotations
+
+import sys
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
 HERE = Path(__file__).resolve().parent
-PANELS_DIR = HERE / "panels"
-OUT = HERE / "entry.png"
+PANEL_DIR = HERE / "panels"
+DEFAULT_OUTPUT = HERE / "repro-entry.png"
 
-SIZE = 1024
-HEADER_H = 118
-GUTTER = 8
-BAND_H = 96
+# --- canvas geometry (pixels, measured off the finished front page) ---
+CANVAS = (1024, 1024)
+MASTHEAD_HEIGHT = 112
+RULE_HEIGHT = 6
+CELL_WIDTH = 508
+PICTURE_HEIGHT = 353
+STRIP_HEIGHT = 100
+ROW_PITCH = 457  # cell (453) plus a 4 px navy gap between the rows
+COLUMN_PITCH = 516  # cell (508) plus an 8 px navy gutter
+# Panels are first shrunk to 672 px wide (448 tall), then the top
+# 508x353 window is cut out, centred horizontally.
+PANEL_PREVIEW_WIDTH = 672
 
-NAVY = (11, 22, 40)
-GOLD = (232, 184, 75)
-WHITE = (245, 247, 250)
-BAND = (8, 14, 26)
+# --- palette ---
+NAVY_MASTHEAD = (11, 22, 40)
+NAVY_STRIP = (8, 14, 26)
+GOLD = (233, 184, 74)
+WHITE = (255, 255, 255)
 
-FONT_DIR = Path("/usr/share/fonts/truetype/dejavu")
-DATE_FONT = ImageFont.truetype(str(FONT_DIR / "DejaVuSans-Bold.ttf"), 54)
-HEAD_FONT = ImageFont.truetype(str(FONT_DIR / "DejaVuSans-Bold.ttf"), 31)
-SUB_FONT = ImageFont.truetype(str(FONT_DIR / "DejaVuSans.ttf"), 22)
+MASTHEAD_TEXT = "FRIDAY 20 NOVEMBER 2026"
 
-PANELS = [
-    ("panel1-cyclone.webp", "CYCLONE AKVAN LANDFALL", "300,000 evacuated as storm hits Odisha"),
-    ("panel2-taiwan.webp", "TAIWAN CURBS IN FORCE", "Short-selling limits bite after rout"),
-    ("panel3-cop31.webp", "COP31: CLOSING DAY", "Final text due on the last day"),
-    ("panel4-presser.webp", "TRUMP BACK FROM CHINA", "White House press conference today"),
-]
+# (panel file, headline, one-line summary), reading order.
+STORIES = (
+    ("panel1-cyclone.webp", "CYCLONE AKVAN LANDFALL",
+     "300,000 evacuated as storm hits Odisha"),
+    ("panel2-taiwan.webp", "TAIWAN CURBS IN FORCE",
+     "Short-selling limits bite after rout"),
+    ("panel3-cop31.webp", "COP31: CLOSING DAY",
+     "Final text due on the last day"),
+    ("panel4-presser.webp", "TRUMP BACK FROM CHINA",
+     "White House press conference today"),
+)
+
+FONT_DIRS = (
+    "/usr/share/fonts/truetype/dejavu",
+    "/usr/share/fonts/truetype/liberation",
+)
 
 
-def center_crop(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
-    """Crop img centrally to the target aspect, then resize to target size."""
-    scale = max(target_w / img.width, target_h / img.height)
-    resized = img.resize(
-        (round(img.width * scale), round(img.height * scale)), Image.LANCZOS
+def pick_font(bold: bool, size: int) -> ImageFont.FreeTypeFont:
+    """Find a DejaVu (or fallback Liberation) face at the given size."""
+    wanted = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    alternates = ("LiberationSans-Bold.ttf",) if bold else ("LiberationSans-Regular.ttf",)
+    for folder in FONT_DIRS:
+        for name in (wanted, *alternates):
+            candidate = Path(folder) / name
+            if candidate.is_file():
+                return ImageFont.truetype(str(candidate), size)
+    return ImageFont.load_default(size=size)
+
+
+def cover_fit(picture: Image.Image, width: int, height: int) -> Image.Image:
+    """Shrink ``picture`` to a 672 px wide preview, then cut the top
+    ``width`` x ``height`` window out of it, centred horizontally.
+
+    The preview keeps the panel's aspect ratio; the window always
+    starts at the top edge, so the skyline / horizon of each
+    illustration stays where the front page shows it.
+    """
+    preview_height = round(picture.height * PANEL_PREVIEW_WIDTH / picture.width)
+    preview = picture.resize(
+        (PANEL_PREVIEW_WIDTH, preview_height), Image.LANCZOS
     )
-    left = (resized.width - target_w) // 2
-    top = (resized.height - target_h) // 2
-    return resized.crop((left, top, left + target_w, top + target_h))
+    left = (preview.width - width) // 2
+    return preview.crop((left, 0, left + width, height))
 
 
-def draw_centered(draw: ImageDraw.ImageDraw, cx: int, y: int, text: str, font, fill) -> None:
-    box = draw.textbbox((0, 0), text, font=font)
-    draw.text((cx - (box[2] - box[0]) // 2, y), text, font=font, fill=fill)
+def draw_cell(canvas: Image.Image, origin_x: int, origin_y: int,
+              panel_file: str, headline: str, summary: str,
+              headline_font, summary_font) -> None:
+    """Paste one picture plus its caption strip at the given cell origin."""
+    picture = Image.open(PANEL_DIR / panel_file).convert("RGB")
+    canvas.paste(
+        cover_fit(picture, CELL_WIDTH, PICTURE_HEIGHT),
+        (origin_x, origin_y),
+    )
+
+    strip_top = origin_y + PICTURE_HEIGHT
+    strip_height = STRIP_HEIGHT
+    canvas.paste(
+        Image.new("RGB", (CELL_WIDTH, strip_height), NAVY_STRIP),
+        (origin_x, strip_top),
+    )
+
+    pen = ImageDraw.Draw(canvas)
+    text_x = origin_x + 16
+    # Headline sits near the top of the strip, summary below it.
+    pen.text((text_x, strip_top + 41), headline, font=headline_font,
+             fill=GOLD, anchor="ls")
+    pen.text((text_x, strip_top + 75), summary, font=summary_font,
+             fill=WHITE, anchor="ls")
 
 
-def main() -> None:
-    page = Image.new("RGB", (SIZE, SIZE), NAVY)
-    draw = ImageDraw.Draw(page)
+def build_page() -> Image.Image:
+    """Assemble the whole front page and return it."""
+    page = Image.new("RGB", CANVAS, NAVY_MASTHEAD)
+    pen = ImageDraw.Draw(page)
 
-    # Header: the day, named in full, over a gold rule.
-    draw_centered(draw, SIZE // 2, 30, "FRIDAY 20 NOVEMBER 2026", DATE_FONT, WHITE)
-    draw.rectangle([0, HEADER_H - 6, SIZE, HEADER_H], fill=GOLD)
+    masthead_font = pick_font(bold=True, size=54)
+    pen.text((CANVAS[0] // 2, 81), MASTHEAD_TEXT, font=masthead_font,
+             fill=WHITE, anchor="ms")
 
-    cell_w = (SIZE - GUTTER) // 2
-    cell_h = (SIZE - HEADER_H - GUTTER) // 2
-    positions = [
-        (0, HEADER_H),
-        (cell_w + GUTTER, HEADER_H),
-        (0, HEADER_H + cell_h + GUTTER),
-        (cell_w + GUTTER, HEADER_H + cell_h + GUTTER),
-    ]
+    pen.rectangle(
+        [(0, MASTHEAD_HEIGHT),
+         (CANVAS[0], MASTHEAD_HEIGHT + RULE_HEIGHT)],
+        fill=GOLD,
+    )
 
-    for (filename, headline, subline), (x, y) in zip(PANELS, positions):
-        art = Image.open(PANELS_DIR / filename).convert("RGB")
-        page.paste(center_crop(art, cell_w, cell_h), (x, y))
-        band_y = y + cell_h - BAND_H
-        draw.rectangle([x, band_y, x + cell_w, y + cell_h], fill=BAND)
-        draw.text((x + 16, band_y + 12), headline, font=HEAD_FONT, fill=GOLD)
-        draw.text((x + 16, band_y + 54), subline, font=SUB_FONT, fill=WHITE)
+    headline_font = pick_font(bold=True, size=31)
+    summary_font = pick_font(bold=False, size=22)
 
-    page.save(OUT, format="PNG")
-    if OUT.stat().st_size > 1_048_576:
-        # The gate reads the format from the first bytes, so a JPEG keeps the
-        # same entry.png name while fitting the 1 MiB cap.
-        page.save(OUT, format="JPEG", quality=90)
-    print(f"wrote {OUT} ({OUT.stat().st_size} bytes)")
+    grid_top = MASTHEAD_HEIGHT + RULE_HEIGHT
+    for index, (panel_file, headline, summary) in enumerate(STORIES):
+        column, row = index % 2, index // 2
+        draw_cell(
+            page,
+            column * COLUMN_PITCH,
+            grid_top + row * ROW_PITCH,
+            panel_file, headline, summary,
+            headline_font, summary_font,
+        )
+    return page
+
+
+def main(argv: list[str]) -> int:
+    output = Path(argv[1]) if len(argv) > 1 else DEFAULT_OUTPUT
+    page = build_page()
+    page.save(output, format="PNG")
+    print(f"wrote {output} ({output.stat().st_size} bytes)")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main(sys.argv))
